@@ -224,6 +224,22 @@ class ProtocolReplaceRequest(BaseModel):
     expected_version: Annotated[int, Field(ge=0)]
 
 
+def _validate_prefix_length(value: Any, handler: Any) -> Any:
+    # Booleans are ints in Python and would otherwise be coerced silently.
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("prefix_length must be an integer")
+    return handler(value)
+
+
+class BranchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    expected_version: Annotated[int, Field(ge=0)]
+    # The upper bound (the source session's current trace length) is checked
+    # against the stored snapshot when the branch is created.
+    prefix_length: Annotated[int, Field(ge=0), WrapValidator(_validate_prefix_length)]
+
+
 class SessionView(BaseModel):
     id: str
     version: int

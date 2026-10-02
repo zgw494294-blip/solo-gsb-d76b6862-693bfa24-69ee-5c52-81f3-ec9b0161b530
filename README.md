@@ -574,7 +574,7 @@ curl -X POST http://localhost:8000/v1/deactivation-plans \
 
 ## 双端协议演练会话
 
-除上述四个离线分析接口外，服务还提供**有状态演练会话**：创建会话后可以逐个执行转移、随时查询当前配置与完整执行轨迹，也可以修改协议后从新初态重放已执行步骤，继续演练。
+除上述四个离线分析接口外，服务还提供**有状态演练会话**：创建会话后可以逐个执行转移、随时查询当前配置与完整执行轨迹，也可以修改协议后从新初态重放已执行步骤，继续演练；还可以从指定轨迹位置另开**分支会话**，两边独立续演。
 
 - 会话（协议、轨迹 ID、版本）持久化在**本地 SQLite 数据库**中，所有进程共享同一文件：服务或容器重建后仍可按原会话 ID 查询并继续执行、替换协议，版本不会回退。
 - 服务默认以 **2 个 Uvicorn worker** 进程运行，启动时自动建库建表（无需迁移旧数据）。
@@ -590,6 +590,7 @@ curl -X POST http://localhost:8000/v1/deactivation-plans \
 | `GET` | `/v1/sessions/{id}` | 查询会话快照 |
 | `POST` | `/v1/sessions/{id}/transitions` | 执行单个转移，请求体 `{"transition_id": ..., "expected_version": ...}` |
 | `PUT` | `/v1/sessions/{id}/protocol` | 替换完整协议，请求体 `{"protocol": {...}, "expected_version": ...}` |
+| `POST` | `/v1/sessions/{id}/branches` | 从指定轨迹位置另开分支会话，请求体 `{"expected_version": ..., "prefix_length": ...}`，返回新会话视图（版本 0） |
 
 响应均为同一会话视图：
 
@@ -602,10 +603,10 @@ curl -X POST http://localhost:8000/v1/deactivation-plans \
 
 状态码：
 
-- 成功：创建 `201`，执行/替换/查询 `200`；
+- 成功：创建与分支 `201`，执行/替换/查询 `200`；
 - `404`：未知会话；
 - `409`：`expected_version` 过期、转移在当前配置下不可执行（含 ID 不存在）、或会话已处于完成配置；
-- `422`：请求体不合法（复用原协议校验，规则同下节）；替换协议时还包括**重放失败**——从新协议初态按已执行 ID 重放时，任一步不可执行或在轨迹结束前到达完成配置，响应体 `detail.first_failed_step` 给出从 1 计的首个失败步。
+- `422`：请求体不合法（复用原协议校验，规则同下节）；替换协议时还包括**重放失败**——从新协议初态按已执行 ID 重放时，任一步不可执行或在轨迹结束前到达完成配置，响应体 `detail.first_failed_step` 给出从 1 计的首个失败步；分支时还包括 `prefix_length` 非法（布尔值、非整数、负数或超过当前轨迹长度）。
 
 替换协议允许改变已有 ID 的转移定义（端点状态、消息、source/target 等），但重放时每一步都必须在新协议下可执行，且不能在轨迹结束前到达完成配置；重放成功后轨迹与当前配置全部按新协议重算。完成配置只禁止继续执行转移，不禁止替换协议。
 
@@ -678,6 +679,74 @@ curl -s -X PUT http://localhost:8000/v1/sessions/$SID/protocol \
 ```
 
 此时会话保持旧协议与版本 `3` 不变。用过期版本（如 `"expected_version": 2`）替换返回 `409`；查询不存在的会话 ID 返回 `404`。
+
+### 分支会话：`POST /v1/sessions/{id}/branches`
+
+在源会话的指定轨迹位置另开一条独立分支，源会话保持可用且不被修改：
+
+- 请求体 `{"expected_version": ..., "prefix_length": ...}`；`prefix_length` 是保留的已执行步数，必须为 **0 至当前轨迹长度的整数**（布尔值、非整数、负数或超过轨迹长度均返回 `422`）。
+- 新会话使用源会话该版本的**当前协议**（源协议曾被替换时采用替换后的定义，不恢复旧协议）与前 `prefix_length` 步轨迹，获得全新会话 ID，版本从 `0` 开始。
+- 新会话的当前配置与可执行转移由前缀轨迹从初态**重算**，不复制源会话末态；`prefix_length` 为 `0` 时即同一协议的空轨迹新会话，为轨迹全长时相当于复制整个会话。
+- 版本检查与复制针对**同一份源快照**：与源会话的修改并发时，要么复制该版本的完整快照，要么按过期返回 `409` 及 `current_version`；源会话不存在返回 `404`。
+- 任何失败都不会生成分支，源会话始终不变；同一源版本可多次分支，其版本号不被消耗。
+- 分支会话是普通会话：沿用执行、替换协议与查询接口，之后两边互不影响，重启后仍可续演。
+
+#### 分支后分别续演示例（端口 8000）
+
+新建会话并执行 `t1`（`version` 变为 `1`，轨迹 `[t1]`）：
+
+```bash
+SID=$(curl -s -X POST http://localhost:8000/v1/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "A": { "states": [0, 1], "initial": 0, "finals": [1] },
+    "B": { "states": [0, 1], "initial": 0, "finals": [1] },
+    "transitions": [
+      { "id": "t1", "from": "A", "to": "B", "action": "send",    "message": "m", "source": 0, "target": 1 },
+      { "id": "t4", "from": "A", "to": "B", "action": "receive", "message": "m", "source": 0, "target": 1 }
+    ]
+  }' | python3 -c 'import sys, json; print(json.load(sys.stdin)["id"])')
+curl -s -X POST http://localhost:8000/v1/sessions/$SID/transitions \
+  -H 'Content-Type: application/json' \
+  -d '{"transition_id": "t1", "expected_version": 0}'
+```
+
+从第 1 步处分支（保留 1 步已执行轨迹）：
+
+```bash
+BID=$(curl -s -X POST http://localhost:8000/v1/sessions/$SID/branches \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_version": 1, "prefix_length": 1}' | python3 -c 'import sys, json; print(json.load(sys.stdin)["id"])')
+echo "$BID"
+```
+
+返回 `201`：新会话 `version` 为 `0`，轨迹为前 1 步，当前配置与可执行转移由该前缀重算（队列 `A_to_B` 为 `"m"`，可执行为 `["t4"]`）。
+
+分支用自己的版本 `0` 继续执行 `t4` 至完成：
+
+```bash
+curl -s -X POST http://localhost:8000/v1/sessions/$BID/transitions \
+  -H 'Content-Type: application/json' \
+  -d '{"transition_id": "t4", "expected_version": 0}'
+```
+
+源会话不受影响，仍用自己的版本继续（`version` 仍为 `1`，执行后变为 `2`）：
+
+```bash
+curl -s -X POST http://localhost:8000/v1/sessions/$SID/transitions \
+  -H 'Content-Type: application/json' \
+  -d '{"transition_id": "t4", "expected_version": 1}'
+```
+
+同一源版本可重复分支（版本号不被消耗），例如再开一条空轨迹分支：
+
+```bash
+curl -s -X POST http://localhost:8000/v1/sessions/$SID/branches \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_version": 2, "prefix_length": 0}'
+```
+
+`prefix_length` 超过当前轨迹长度、为负数或布尔值时返回 `422`；`expected_version` 过期返回 `409` 及当前版本；源会话不存在返回 `404`；失败时不生成分支。
 
 ### 存储位置与卷保留规则
 

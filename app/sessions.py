@@ -19,6 +19,14 @@ succeed — the loser re-reads the stored version and answers 409. A failed
 mutation raises before commit and leaves the stored session untouched. Reads
 observe one committed version at a time, and a successful response is built
 from the values its own transaction committed, never from later commits.
+
+A session can also be branched: a new independent session is created from the
+source's current protocol and a prefix of its trace. The version check and the
+copy run inside one immediate transaction against the same source snapshot, so
+a concurrent source modification either commits first (the branch answers 409)
+or waits until the expected version has been copied whole. The source row is
+never written, so its version is not consumed and the same version can be
+branched repeatedly; a failed branch creates nothing.
 """
 
 import json
@@ -177,6 +185,61 @@ def replace_protocol(session_id: str, protocol, expected_version: int) -> dict:
         return version + 1, protocol, trace_ids
 
     return _update_session(session_id, mutate)
+
+
+def branch_session(session_id: str, expected_version: int, prefix_length: int) -> dict:
+    """Create an independent session from a prefix of the source trace.
+
+    The version check and the copy run inside one immediate transaction, so a
+    concurrent modification of the source either commits first (the branch
+    then observes the new version and answers 409) or waits until the whole
+    snapshot of the expected version has been copied. The source row is never
+    written: its version is not consumed and the same version can be branched
+    repeatedly. Any failure raises before commit and creates no branch.
+
+    The branch starts at version 0 with the source's current (possibly
+    replaced) protocol; its configuration and enabled transitions are
+    recomputed by replaying the prefix from the initial configuration, never
+    copied from the source's final state.
+    """
+    connection = _connect()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT version, protocol, trace_ids FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="unknown session")
+        version, protocol_text, trace_text = row
+        if version != expected_version:
+            raise _version_conflict(version)
+        trace_ids = json.loads(trace_text)
+        if not 0 <= prefix_length <= len(trace_ids):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "invalid_prefix_length",
+                    "prefix_length": prefix_length,
+                    "trace_length": len(trace_ids),
+                },
+            )
+
+        branch_id = uuid4().hex
+        branch_trace_ids = trace_ids[:prefix_length]
+        connection.execute(
+            "INSERT INTO sessions (id, version, protocol, trace_ids) VALUES (?, ?, ?, ?)",
+            (branch_id, 0, protocol_text, json.dumps(branch_trace_ids)),
+        )
+        connection.commit()
+        protocol = DeadlockRequest.model_validate(json.loads(protocol_text))
+        return _session_view(branch_id, 0, protocol, branch_trace_ids)
+    except BaseException:
+        # No-op when the commit already succeeded.
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 def _update_session(session_id: str, mutate) -> dict:

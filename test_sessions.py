@@ -275,7 +275,157 @@ r = client.put(f"/v1/sessions/{sid}/protocol",
                json={"expected_version": 4})
 check("missing protocol 422", r.status_code == 422)
 
-# 16. existing offline endpoints still work
+# 16. branching: copy a trace prefix into an independent session
+# fresh source: execute t1 only -> version 1, trace [t1]
+r = client.post("/v1/sessions", json=P)
+sid3 = r.json()["id"]
+client.post(f"/v1/sessions/{sid3}/transitions",
+            json={"transition_id": "t1", "expected_version": 0})
+
+r = client.post(f"/v1/sessions/{sid3}/branches",
+                json={"expected_version": 1, "prefix_length": 1})
+check("branch 201", r.status_code == 201, r.status_code)
+b = r.json()
+bid = b["id"]
+check("branch new id", bool(bid) and bid != sid3)
+check("branch version 0", b["version"] == 0)
+check("branch trace is prefix", [s["transition_id"] for s in b["trace"]] == ["t1"])
+check("branch trace reindexed", b["trace"][0]["index"] == 1)
+check("branch config recomputed", b["configuration"] == {
+    "state": {"A": 1, "B": 0}, "queues": {"A_to_B": "m", "B_to_A": None}},
+    b["configuration"])
+check("branch enabled recomputed", b["enabled_transition_ids"] == ["t4"],
+      b["enabled_transition_ids"])
+
+# source untouched by the branch: version not consumed, trace unchanged
+src = client.get(f"/v1/sessions/{sid3}").json()
+check("source version not consumed", src["version"] == 1)
+check("source trace unchanged", [s["transition_id"] for s in src["trace"]] == ["t1"])
+
+# the same source version branches again: empty prefix
+r = client.post(f"/v1/sessions/{sid3}/branches",
+                json={"expected_version": 1, "prefix_length": 0})
+check("branch empty prefix 201", r.status_code == 201, r.status_code)
+b2 = r.json()
+bid2 = b2["id"]
+check("branch empty prefix new id", bid2 not in (sid3, bid))
+check("branch empty trace", b2["trace"] == [])
+check("branch initial config", b2["configuration"] == {
+    "state": {"A": 0, "B": 0}, "queues": {"A_to_B": None, "B_to_A": None}})
+check("branch initial enabled", b2["enabled_transition_ids"] == ["t1"])
+
+# the branch continues on its own: execute t4 to completion
+r = client.post(f"/v1/sessions/{bid}/transitions",
+                json={"transition_id": "t4", "expected_version": 0})
+check("branch execute 200", r.status_code == 200, r.status_code)
+check("branch version 1", r.json()["version"] == 1)
+check("branch completed", r.json()["enabled_transition_ids"] == [])
+# ... and the source is unaffected
+src = client.get(f"/v1/sessions/{sid3}").json()
+check("source unaffected by branch execute", src["version"] == 1
+      and src["configuration"]["queues"] == {"A_to_B": "m", "B_to_A": None})
+
+# the source also continues on its own
+r = client.post(f"/v1/sessions/{sid3}/transitions",
+                json={"transition_id": "t4", "expected_version": 1})
+check("source execute after branch 200", r.status_code == 200, r.status_code)
+check("source version 2", r.json()["version"] == 2)
+
+# full-length prefix copies the whole trace (branch is completed too)
+r = client.post(f"/v1/sessions/{sid3}/branches",
+                json={"expected_version": 2, "prefix_length": 2})
+check("branch full prefix 201", r.status_code == 201, r.status_code)
+b = r.json()
+check("full prefix trace", [s["transition_id"] for s in b["trace"]] == ["t1", "t4"])
+check("full prefix completed", b["enabled_transition_ids"] == []
+      and b["configuration"]["state"] == {"A": 1, "B": 1})
+
+# the branch supports protocol replacement; the source protocol is unchanged
+r = client.put(f"/v1/sessions/{bid2}/protocol",
+               json={"protocol": P2, "expected_version": 0})
+check("branch replace 200", r.status_code == 200, r.status_code)
+check("branch replace version 1", r.json()["version"] == 1)
+check("source protocol unchanged",
+      client.get(f"/v1/sessions/{sid3}").json()["protocol"]["transitions"][0]["target"] == 1)
+
+# a branch of a replaced protocol uses the replaced definitions:
+# sid is at version 5 with protocol P2 (t1 loops A 0->0) and trace [t1, t4, t1]
+r = client.post(f"/v1/sessions/{sid}/branches",
+                json={"expected_version": 5, "prefix_length": 2})
+check("branch of replaced 201", r.status_code == 201, (r.status_code, r.text))
+b = r.json()
+check("replaced protocol copied", b["protocol"]["transitions"][0]["target"] == 0)
+check("recomputed under replaced defs", b["configuration"] == {
+    "state": {"A": 0, "B": 1}, "queues": {"A_to_B": None, "B_to_A": None}},
+    b["configuration"])
+check("recomputed enabled under replaced defs", b["enabled_transition_ids"] == ["t1"],
+      b["enabled_transition_ids"])
+
+# stale version -> 409 with current_version; no branch created
+r = client.post(f"/v1/sessions/{sid3}/branches",
+                json={"expected_version": 1, "prefix_length": 1})
+check("branch stale 409", r.status_code == 409, r.status_code)
+check("branch stale current_version",
+      r.json()["detail"] == {"error": "version_conflict", "current_version": 2},
+      r.json())
+
+# unknown source -> 404
+r = client.post("/v1/sessions/deadbeef/branches",
+                json={"expected_version": 0, "prefix_length": 0})
+check("branch unknown 404", r.status_code == 404)
+
+# invalid prefix_length -> 422 (source unchanged, no branch created)
+for bad_body, name in [
+    ({"expected_version": 2, "prefix_length": 3}, "prefix beyond trace"),
+    ({"expected_version": 2, "prefix_length": -1}, "negative prefix"),
+    ({"expected_version": 2, "prefix_length": True}, "boolean prefix"),
+    ({"expected_version": 2, "prefix_length": False}, "false prefix"),
+    ({"expected_version": 2, "prefix_length": "1"}, "string prefix"),
+    ({"expected_version": 2, "prefix_length": 1.0}, "float prefix"),
+    ({"expected_version": 2}, "missing prefix"),
+]:
+    r = client.post(f"/v1/sessions/{sid3}/branches", json=bad_body)
+    check(f"{name} 422", r.status_code == 422, (r.status_code, r.text))
+check("source still version 2",
+      client.get(f"/v1/sessions/{sid3}").json()["version"] == 2)
+
+# concurrent branch vs source modification: every branch either copies the
+# expected version's whole snapshot or is rejected as stale; the source
+# modification succeeds exactly once and the source ends at version 1.
+r = client.post("/v1/sessions", json=P)
+sid4 = r.json()["id"]
+results = {}
+barrier = threading.Barrier(5)
+
+
+def worker_branch(tag):
+    barrier.wait()
+    rr = client.post(f"/v1/sessions/{sid4}/branches",
+                     json={"expected_version": 0, "prefix_length": 0})
+    results[tag] = rr.status_code
+
+
+def worker_execute():
+    barrier.wait()
+    rr = client.post(f"/v1/sessions/{sid4}/transitions",
+                     json={"transition_id": "t1", "expected_version": 0})
+    results["execute"] = rr.status_code
+
+
+threads = [threading.Thread(target=worker_branch, args=(f"branch{i}",))
+           for i in range(4)]
+threads.append(threading.Thread(target=worker_execute))
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+check("concurrent execute succeeds", results["execute"] == 200, results)
+check("concurrent branches copied or stale",
+      all(results[f"branch{i}"] in (201, 409) for i in range(4)), results)
+check("concurrent source version 1",
+      client.get(f"/v1/sessions/{sid4}").json()["version"] == 1)
+
+# 17. existing offline endpoints still work
 r = client.get("/healthz")
 check("healthz", r.status_code == 200 and r.json() == {"status": "ok"})
 r = client.post("/v1/deadlocks", json=P)
