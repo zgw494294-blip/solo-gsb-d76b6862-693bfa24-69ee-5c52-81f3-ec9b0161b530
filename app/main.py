@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from . import sessions
 from .analyzer import analyze, analyze_guarantee, plan_completion, plan_deactivation
 from .schemas import (
+    BranchCreateRequest,
     CompletionRequest,
     CompletionResponse,
     DeadlockRequest,
@@ -86,4 +87,11 @@ def execute_session_transition(session_id: str, request: ExecutionRequest) -> di
 def replace_session_protocol(session_id: str, request: ProtocolReplaceRequest) -> dict:
     return sessions.replace_protocol(
         session_id, request.protocol, request.expected_version
+    )
+
+
+@app.post("/v1/sessions/{session_id}/branches", response_model=SessionView, status_code=201)
+def branch_session(session_id: str, request: BranchCreateRequest) -> dict:
+    return sessions.create_branch(
+        session_id, request.expected_version, request.prefix_length
     )

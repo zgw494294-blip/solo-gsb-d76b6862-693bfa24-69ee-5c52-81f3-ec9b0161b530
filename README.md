@@ -581,6 +581,7 @@ curl -X POST http://localhost:8000/v1/deactivation-plans \
 - 每次成功执行转移或替换协议，会话 `version` 加 1（创建时为 `0`）。
 - 修改类请求必须携带 `expected_version`：与当前版本不一致返回 `409`；两个进程以同一 `expected_version` 并发修改同一会话时只有一项成功，其余返回 `409` 及当前版本。
 - 版本检查、轨迹重放与写入在同一个 SQLite 事务（`BEGIN IMMEDIATE`）内完成，针对同一份已提交状态；任何失败（含重放失败）都不改动已存数据。成功响应返回本次提交的完整快照（不混入随后提交的数据），查询永远只读到完整的已提交版本。
+- 可以从任意会话的**指定轨迹位置另开分支**：新会话携带源会话当前协议与前缀轨迹、版本从 `0` 开始，配置与可执行转移由前缀重放重算；源会话完全不变、版本不被消耗，同一源版本可多次分支，之后两个会话互不影响。
 
 ### 接口
 
@@ -590,6 +591,7 @@ curl -X POST http://localhost:8000/v1/deactivation-plans \
 | `GET` | `/v1/sessions/{id}` | 查询会话快照 |
 | `POST` | `/v1/sessions/{id}/transitions` | 执行单个转移，请求体 `{"transition_id": ..., "expected_version": ...}` |
 | `PUT` | `/v1/sessions/{id}/protocol` | 替换完整协议，请求体 `{"protocol": {...}, "expected_version": ...}` |
+| `POST` | `/v1/sessions/{id}/branches` | 从指定轨迹位置另开分支，请求体 `{"expected_version": ..., "prefix_length": ...}`，返回新会话（版本 0） |
 
 响应均为同一会话视图：
 
@@ -602,10 +604,10 @@ curl -X POST http://localhost:8000/v1/deactivation-plans \
 
 状态码：
 
-- 成功：创建 `201`，执行/替换/查询 `200`；
-- `404`：未知会话；
+- 成功：创建与分支 `201`，执行/替换/查询 `200`；
+- `404`：未知会话（分支时为未知源会话）；
 - `409`：`expected_version` 过期、转移在当前配置下不可执行（含 ID 不存在）、或会话已处于完成配置；
-- `422`：请求体不合法（复用原协议校验，规则同下节）；替换协议时还包括**重放失败**——从新协议初态按已执行 ID 重放时，任一步不可执行或在轨迹结束前到达完成配置，响应体 `detail.first_failed_step` 给出从 1 计的首个失败步。
+- `422`：请求体不合法（复用原协议校验，规则同下节）；替换协议时还包括**重放失败**——从新协议初态按已执行 ID 重放时，任一步不可执行或在轨迹结束前到达完成配置，响应体 `detail.first_failed_step` 给出从 1 计的首个失败步；分支时还包括 `prefix_length` 非法（负数、布尔/字符串/小数等非整数值，或大于源会话当前轨迹长度，响应体 `detail.error` 为 `"invalid_prefix_length"`）。
 
 替换协议允许改变已有 ID 的转移定义（端点状态、消息、source/target 等），但重放时每一步都必须在新协议下可执行，且不能在轨迹结束前到达完成配置；重放成功后轨迹与当前配置全部按新协议重算。完成配置只禁止继续执行转移，不禁止替换协议。
 
@@ -678,6 +680,52 @@ curl -s -X PUT http://localhost:8000/v1/sessions/$SID/protocol \
 ```
 
 此时会话保持旧协议与版本 `3` 不变。用过期版本（如 `"expected_version": 2`）替换返回 `409`；查询不存在的会话 ID 返回 `404`。
+
+### 分支会话：从指定轨迹位置另开演练
+
+`POST /v1/sessions/{id}/branches` 用**源会话当前版本的协议**和轨迹的**前 `prefix_length` 步**创建一个独立的新会话：
+
+- 请求体 `{"expected_version": ..., "prefix_length": ...}`；`prefix_length` 必须是 `0` 到源会话当前轨迹长度之间的整数（布尔、字符串、小数等均返回 `422`）；
+- 新会话版本为 `0`，轨迹为源轨迹的前缀，**当前配置与可执行转移由该前缀从初态重放重算**（不是复制源会话的末态）；源会话替换过协议时，分支携带**替换后的**协议定义；
+- 源会话完全不变：版本不被消耗，同一源版本可以重复分支；分支与源修改并发时，要么完整复制该版本快照，要么因版本过期返回 `409`；
+- 新会话是普通持久会话：照常使用执行、替换协议与查询接口，重启后仍可续演，与源会话互不影响。
+
+接上面的例子（源会话 `$SID` 当前版本 `3`，轨迹两步，当前配置 A=0、B=1），从第 1 步处另开分支：
+
+```bash
+BID=$(curl -s -X POST http://localhost:8000/v1/sessions/$SID/branches \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_version": 3, "prefix_length": 1}' \
+  | python3 -c 'import sys, json; print(json.load(sys.stdin)["id"])')
+echo "$BID"
+```
+
+返回 `201`，新会话 `version` 为 `0`，`trace` 只含 `t1` 一步；由于源会话的协议已替换（`t1` 是 A 端自环 0→0），分支按**替换后的定义**重算，当前配置为 A=0、B=0、队列 `A_to_B` 为 `"m"`，`enabled_transition_ids` 为 `["t4"]`。
+
+在分支上继续演练（执行 `t4`，携带分支自己的版本 `0`）：
+
+```bash
+curl -s -X POST http://localhost:8000/v1/sessions/$BID/transitions \
+  -H 'Content-Type: application/json' \
+  -d '{"transition_id": "t4", "expected_version": 0}'
+```
+
+返回 `200`，分支 `version` 变为 `1`，配置 A=0、B=1、队列均空。源会话不受任何影响，仍可用自己的版本继续演练（执行 `t1`，`expected_version` 仍为 `3`）：
+
+```bash
+curl -s -X POST http://localhost:8000/v1/sessions/$SID/transitions \
+  -H 'Content-Type: application/json' \
+  -d '{"transition_id": "t1", "expected_version": 3}'
+```
+
+返回 `200`，源会话 `version` 变为 `4`。此后两个会话各自独立演进，查询互不影响：
+
+```bash
+curl -s http://localhost:8000/v1/sessions/$SID   # 源会话：version 4，轨迹 3 步
+curl -s http://localhost:8000/v1/sessions/$BID   # 分支：version 1，轨迹 2 步
+```
+
+分支不消耗源版本：在源会话仍为版本 `3` 时重复上面的分支请求，每次都会得到一个版本 `0` 的新会话。`prefix_length` 超出轨迹长度（如轨迹长 2 时传 `3`）返回 `422`；`expected_version` 过期返回 `409` 及 `current_version`；失败时不生成分支，源会话始终不变。
 
 ### 存储位置与卷保留规则
 

@@ -1,6 +1,6 @@
 from typing import Annotated, Any, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field, WrapValidator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, WrapValidator, model_validator
 from typing_extensions import Self
 
 
@@ -222,6 +222,15 @@ class ProtocolReplaceRequest(BaseModel):
 
     protocol: DeadlockRequest
     expected_version: Annotated[int, Field(ge=0)]
+
+
+class BranchCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    expected_version: Annotated[int, Field(ge=0)]
+    # Strict int: booleans (and floats/strings) are not accepted as a step
+    # count; the upper bound is the source trace length, checked per request.
+    prefix_length: Annotated[StrictInt, Field(ge=0)]
 
 
 class SessionView(BaseModel):
